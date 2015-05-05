@@ -1,6 +1,8 @@
 var through = require("through2")
 var Diff = require("diff-stream2")
 
+var maxRetries = 12;
+
 function shallowCopy(obj) {
   return Object.keys(obj).reduce(function(acc, key) {
     acc[key] = obj[key]
@@ -97,9 +99,40 @@ function createTableComparator(schema) {
   }
 }
 
+function makeRetryRequest (db, operation, params, done, retryCount, maxRetries) {
+  if (retryCount >= maxRetries) return done(new Error("Maximum retries exceeded"));
+
+  db.makeRequest(operation, params, function (err, data) {
+
+    if (!err) {
+      if (data.UnprocessedItems && Object.keys(data.UnprocessedItems).length) {
+        params.RequestItems = data.UnprocessedItems;
+        return setTimeout(makeRetryRequest, delayLength(retryCount), db, operation, params, done, retryCount+1, maxRetries);
+      } else {
+        return done(err, data);
+      }
+    }
+
+    if (err.statusCode >= 500 ||
+        err.code == "ProvisionedThroughputExceededException" ||
+        err.code == "ThrottlingException"
+    ) {
+        return setTimeout(makeRetryRequest, delayLength(retryCount), db, operation, params, done, retryCount+1, maxRetries);
+    } else {
+        return done(err, data);
+    }
+
+  });
+
+  function delayLength (retryCount) {
+    return Math.pow(2, retryCount) * 50;
+  }
+
+}
+
 function ReadStream(db, operation, params) {
-  var requestStream = through.obj(function(req, enc, cb) {
-    db.makeRequest(req.operation, req.params, cb)
+  var requestStream = through.obj(function (req, enc, cb) {
+    makeRetryRequest(db, req.operation, req.params, cb, 0, maxRetries);
   })
   var req = {
     operation: operation,
@@ -159,30 +192,8 @@ function WriteStream(db, operation, params) {
       operation: "batchWriteItem",
       params: {RequestItems: {}}
     }
-
     req.params.RequestItems[params.TableName] = items
-
-    var retries = 0;
-    var maxRetries = 12;
-
-    makeRequest(req.operation, req.params, cb);
-
-    function makeRequest (operation, params, done) {
-      db.makeRequest(operation, params, function(err, data) {
-
-        if (err) return done(err);
-        if (Object.keys(data.UnprocessedItems).length == 0) return done();
-
-        params.RequestItems = data.UnprocessedItems;
-        // Exponential backoff
-        var delay = Math.pow(retries++, 2) * 50;
-        if (retries > maxRetries) return done(new Error("Maximum retries exceeded"), data);
-
-        // console.log("Retrying UnprocessedItems with delay %d", delay);
-        setTimeout(makeRequest, delay, operation, params, done);
-
-      });
-    }
+    makeRetryRequest(db, req.operation, req.params, cb, 0, maxRetries);
   }
 }
 
