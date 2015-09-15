@@ -173,11 +173,16 @@ function WriteStream(db, operation, params) {
 
   function transform(data, enc, cb) {
     ops.push(data)
-    ops.length < 25 ? cb() : flush(cb)
+    ops.length < 25 ? cb() : processBatch(cb, false)
   }
 
   function flush(cb) {
-    if (ops.length == 0) return cb()
+    // final flush call from stream
+    processBatch(cb, true);
+  }
+
+  function processBatch(cb, finalBatch) {
+    if (ops.length == 0) return cb();
 
     var items = ops.splice(0, 25).map(function(item) {
       item = serialize(item).M
@@ -193,7 +198,11 @@ function WriteStream(db, operation, params) {
       params: {RequestItems: {}}
     }
     req.params.RequestItems[params.TableName] = items
-    makeRetryRequest(db, req.operation, req.params, cb, 0, maxRetries);
+    makeRetryRequest(db, req.operation, req.params, function (err, data) {
+      if (err) return cb(err);
+      if (finalBatch) return batch.end(cb);
+      return cb();
+    }, 0, maxRetries);
   }
 }
 
